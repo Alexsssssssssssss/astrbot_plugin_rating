@@ -11,24 +11,25 @@ from urllib.parse import parse_qs, quote, urlsplit, urljoin, urldefrag
 from playwright.async_api import async_playwright, Error as BrowserError
 from bs4 import BeautifulSoup
 
-from .reports import AnalysisError, ReportError, parse_report_payload, log_matches
+from .reports import AnalysisError, ReportError, parse_report_payload, response_summary, log_matches
 from .captcha import TURNSTILE_CAPTURE
 
 MORTAL_SITE = "https://mjai.ekyu.moe/zh-cn.html"
-MORTAL_FLOW_VERSION = "submission-diagnostics-v5"
+MORTAL_FLOW_VERSION = "report-body-v7"
 
 
 class MortalBrowser:
     """串行使用官方网站表单，可选接入 Turnstile 求解；错误时停止。"""
-    def __init__(self, captcha_solver=None):
+    def __init__(self, captcha_solver=None, show_browser=False):
         self.pw = self.browser = self.context = None
         self.last_submit = 0
         self.captcha_solver = captcha_solver
         self.progress = lambda message: None
+        self.show_browser = show_browser
 
     async def __aenter__(self):
         self.pw = await async_playwright().start()
-        opts = {"headless": os.getenv("MORTAL_HEADLESS", "1") != "0"}
+        opts = {"headless": not self.show_browser and os.getenv("MORTAL_HEADLESS", "1") != "0"}
         executable = os.getenv("CHROMIUM_PATH") or shutil.which("chromium") or shutil.which("google-chrome")
         if executable:
             opts["executable_path"] = executable
@@ -318,6 +319,7 @@ class MortalBrowser:
                 url = urlsplit(response.url)
                 diagnostics.append({"method": request.method, "host": url.hostname,
                     "path": url.path, "status": response.status,
+                    "body_received": response in bodies,
                     "post_matches": self.submission_matches(request, game),
                     "linked_by_server": urldefrag(response.url)[0] in linked_targets})
             # Never write request bodies, query strings, cookies or raw exception
@@ -382,6 +384,7 @@ class MortalBrowser:
             submit_deadline = time.monotonic() + 3
             confirmed = False
             announced = set()
+            summarized = set()
             deadline = time.monotonic() + int(os.getenv("MORTAL_TIMEOUT", "300"))
             last_error = "未收到报告"
             unverified = None
@@ -426,12 +429,17 @@ class MortalBrowser:
                             continue
                         if bound and response not in announced:
                             announced.add(response)
-                            self.progress(f'网站返回 HTTP {response.status}，正在检查报告或跳转')
+                            self.progress(f'网站返回 HTTP {response.status} 响应头，正在读取正文并检查页面')
                         html = ""
                         if 200 <= response.status < 300:
                             if response not in bodies:
-                                bodies[response] = await response.text()
+                                # response.text() 会等待整个响应关闭；后台读取，
+                                # 主循环继续检查已渲染的报告和下载，避免卡在这里。
+                                continue
                             html = bodies[response]
+                            if bound and response not in summarized:
+                                summarized.add(response)
+                                self.progress(response_summary(html))
                         if bound:
                             linked_targets.update(self.server_redirect_targets(response, html))
                         if response.status != 200:
@@ -463,17 +471,20 @@ class MortalBrowser:
                     result['report_url'] = download_url
                     result['requested_model'] = os.getenv('MORTAL_MODEL_TAG', '4.1b')
                     return result, content
-                # Legacy reports with explicit IDs remain valid. Missing IDs
-                # wait for the response event instead of failing in a popup race.
+                # Inspect rendered reports even if the HTTP body is still open.
+                # Missing IDs require the exact POST/explicit redirect provenance.
                 for p in self.context.pages:
                     for frame in p.frames:
                         try:
-                            html = await frame.content()
+                            async with asyncio.timeout(5):
+                                html = await frame.content()
                             result = parse_report_payload(html, game["seat"])
-                            if not result.get("log_id"):
+                            frame_bound = urldefrag(frame.url)[0] in linked_targets or any(
+                                r.url == frame.url and self.submission_matches(r.request, game) for r in responses)
+                            if not result.get("log_id") and not frame_bound:
                                 unverified = (result, html)
                                 continue
-                            self.validate_report_identity(result, html, game)
+                            self.validate_report_identity(result, html, game, frame_bound)
                             result['requested_model'] = os.getenv('MORTAL_MODEL_TAG', '4.1b')
                             if urlsplit(frame.url).netloc == 'mjai.ekyu.moe':
                                 result['report_url'] = frame.url
@@ -486,7 +497,7 @@ class MortalBrowser:
                                 raise
                             if any(s in last_error for s in ("未公开 Rating", "与目标用户不符", "无法与当前比赛匹配", "缺少牌谱 ID", "牌谱 ID 与当前比赛不同")):
                                 raise
-                        except BrowserError:
+                        except (BrowserError, TimeoutError):
                             continue
                 try:
                     text = await page.locator("body").inner_text(timeout=2000)

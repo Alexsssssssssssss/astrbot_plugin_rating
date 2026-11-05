@@ -103,3 +103,29 @@ async def test_unrelated_json_without_log_id_is_never_adopted(game, report, monk
         await browser.context.route('https://mjai.ekyu.moe/**', handle)
         with pytest.raises(AnalysisError, match='超时'):
             await browser.analyze(game)
+
+
+@pytest.mark.parametrize('include_id', [True, False])
+async def test_rendered_report_does_not_wait_for_response_body_end(game, html_report, monkeypatch, include_id):
+    import asyncio
+    from playwright.async_api import Response
+    original = Response.text
+    stopped = []
+    async def text(self):
+        if self.url.endswith('/review'):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.append(True)
+        return await original(self)
+    monkeypatch.setattr(Response, 'text', text)
+    if not include_id:
+        html_report = html_report.replace('<dt>牌谱 ID</dt><dd>test-game-001</dd>', '')
+    async with MortalBrowser() as browser:
+        async def handle(route):
+            content = html_report if route.request.method == 'POST' else OFFICIAL_FORM.replace(' disabled', '')
+            await route.fulfill(content_type='text/html', body=content)
+        await browser.context.route('https://mjai.ekyu.moe/**', handle)
+        result, _ = await asyncio.wait_for(browser.analyze(game), timeout=12)
+        assert result['rating'] == 90.25 and result['log_id'] == game['uuid']
+    assert stopped

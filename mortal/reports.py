@@ -15,6 +15,36 @@ class ReportError(AnalysisError):
     """服务器明确返回的终止错误，不应重试解析直到超时。"""
 
 
+def response_summary(content):
+    """只报告结构和已知字段名，不包含正文、字段值、URL 或密钥。"""
+    labels = []
+    kind = 'HTML'
+    if content.lstrip().startswith(('{', '[')):
+        kind = 'JSON'
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict):
+                labels = [key for key in ('engine', 'player_id', 'log_id', 'review', 'error', 'status') if key in data]
+        except ValueError:
+            kind = '无效 JSON'
+        extra = ''
+    else:
+        soup = BeautifulSoup(content, 'html.parser')
+        keys = {dt.get_text(' ', strip=True).casefold() for dt in soup.select('dt')}
+        for label, aliases in (
+            ('引擎', {'ai 引擎', 'ai engine', 'engine', 'ai', 'ai 엔진'}),
+            ('座位', {'玩家 id', 'player id', 'プレイヤーid', '작사 id'}),
+            ('Rating', {'rating'}),
+            ('一致率', {'ai 一致率', 'matches/total', 'ai一致率', 'ai 일치율'}),
+            ('牌谱ID', {'牌谱 id', 'log id', 'ログid', '로그 id'}),
+        ):
+            if keys & aliases:
+                labels.append(label)
+        extra = (f"；iframe={len(soup.select('iframe'))}；script={len(soup.select('script'))}"
+                 f"；检讨表单={'有' if soup.select_one('form[name=reviewForm]') else '无'}")
+    return f"响应摘要：{kind}，正文 {len(content.encode('utf-8'))} 字节；已知字段={','.join(labels) or '无'}{extra}"
+
+
 def parse_report_payload(content, expected_seat=None):
     if content.lstrip().startswith(('{', '[')):
         try:

@@ -30,6 +30,11 @@
     "type": "int",
     "default": 4
   },
+  "show_browser": {
+    "description": "显示浏览器窗口（Windows 桌面排查报告页面时开启）",
+    "type": "bool",
+    "default": false
+  },
   "progress_interval": {
     "description": "等待期间发送进度的间隔（秒，10–120）",
     "type": "int",

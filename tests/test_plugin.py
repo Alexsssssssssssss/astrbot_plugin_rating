@@ -80,6 +80,8 @@ async def test_group_mentions_requester(plugin, monkeypatch):
 def test_captcha_configuration(plugin, monkeypatch):
     monkeypatch.delenv('TWOCAPTCHA_API_KEY', raising=False)
     assert plugin._make_browser().captcha_solver is None
+    plugin.config['show_browser'] = True
+    assert plugin._make_browser().show_browser is True
     plugin.config['captcha_provider'] = '2captcha'
     with pytest.raises(Exception, match='API Key'):
         plugin._make_browser()

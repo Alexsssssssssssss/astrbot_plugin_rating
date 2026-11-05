@@ -56,3 +56,12 @@ def test_error_pages_are_terminal():
         parse_report_payload('<title>Error</title><p>Invalid Turnstile token</p>', 1)
     with pytest.raises(ReportError, match='未被接受'):
         parse_report_payload('<form name="reviewForm"></form>', 1)
+
+
+def test_response_summary_never_contains_field_values():
+    from mortal.reports import response_summary
+    secret = 'secret-token-should-not-leak'
+    html = f'<title>{secret}</title><dl><dt>rating</dt><dd>{secret}</dd></dl><script>{secret}</script>'
+    summary = response_summary(html)
+    assert secret not in summary and 'Rating' in summary and 'script=1' in summary
+    assert secret not in response_summary('{"engine":"' + secret + '"}')

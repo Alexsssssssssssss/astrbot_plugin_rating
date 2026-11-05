@@ -77,6 +77,20 @@ async def test_group_mentions_requester(plugin, monkeypatch):
     assert replies[-1] == [('at', '123'), ('plain', '\n结果')]
 
 
+def test_captcha_configuration(plugin, monkeypatch):
+    monkeypatch.delenv('TWOCAPTCHA_API_KEY', raising=False)
+    assert plugin._make_browser().captcha_solver is None
+    plugin.config['captcha_provider'] = '2captcha'
+    with pytest.raises(Exception, match='API Key'):
+        plugin._make_browser()
+    plugin.config['twocaptcha_api_key'] = 'test-config-key'
+    plugin.config['twocaptcha_max_tasks'] = 2
+    browser = plugin._make_browser()
+    assert browser.captcha_solver.max_tasks == 2
+    monkeypatch.setenv('TWOCAPTCHA_API_KEY', 'test-env-key')
+    assert plugin._make_browser().captcha_solver._api_key == 'test-env-key'
+
+
 async def test_terminate_cancels_active_analysis(plugin, monkeypatch):
     started = asyncio.Event()
     cleaned = asyncio.Event()

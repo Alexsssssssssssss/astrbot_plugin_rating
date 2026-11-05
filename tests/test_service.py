@@ -98,5 +98,3 @@ async def test_queue_limit_serialization_and_cancellation():
     task.cancel()
     with pytest.raises(asyncio.CancelledError): await task
     assert service.pending == 0 and exited.is_set()
-
-

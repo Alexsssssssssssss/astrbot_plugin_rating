@@ -48,6 +48,10 @@ Linux 缺少浏览器系统库时，按 Playwright 官方方式使用 `python -m
 | `auto_detect` | `true` | 自动识别直接发送的链接；关闭后使用 `/rating` |
 | `cooldown_seconds` | `60` | 每名用户的提交间隔 |
 | `max_pending` | `3` | 运行中与排队任务总数，实际限制为 1–20 |
+| `captcha_provider` | `manual` | 改成 `2captcha` 后启用付费 Turnstile 求解 |
+| `twocaptcha_api_key` | 空 | 2Captcha API Key，仅在管理面板填写 |
+| `twocaptcha_timeout` | `180` | 验证任务等待秒数，范围 10–600 |
+| `twocaptcha_max_tasks` | `4` | 每份牌谱最多创建的付费任务，范围 1–4 |
 
 同一插件实例只运行一组分析，避免同时打开大量浏览器。用户冷却跨群聊和私聊生效。遇到验证、限流或报告错误时停止后续座位并保留已成功结果。任务与冷却记录保存在内存中；重启不恢复未完成任务，卸载时取消任务并关闭浏览器。
 
@@ -63,13 +67,25 @@ Linux 缺少浏览器系统库时，按 Playwright 官方方式使用 `python -m
 | `MORTAL_HEADLESS` | `1` | 无头运行；有桌面时可设为 `0` |
 | `RATING_DATA_DIR` | `.data` | 报告归属异常时的本地诊断目录 |
 
-模型版本按网站实际返回值显示。插件不自动加载 `.env`。默认不接入付费验证码服务，不绕过网站验证，也不关闭 TLS 校验。
+模型版本按网站实际返回值显示。插件不自动加载 `.env`。默认不调用付费验证服务，TLS 校验始终开启。
+
+## 2Captcha 接入（v1.1.0）
+
+1. 更新插件到 v1.1.0，在 AstrBot 插件设置中将 `captcha_provider` 选为 `2captcha`。
+2. 在 `twocaptcha_api_key` 中填写自己的 2Captcha API Key，保存并重载插件。不要把密钥发到群聊。也可设置 AstrBot 进程环境变量 `TWOCAPTCHA_API_KEY`，环境变量优先。
+3. 确认账户有余额、AstrBot 能通过 HTTPS 访问 `api.2captcha.com`，再发送 `/rating 牌谱链接`。
+
+只有 Mortal 的提交按钮仍被验证禁用时才调用 2Captcha。插件读取当前页面实际的 Turnstile sitekey、action、cData/chlPageData，提交 `TurnstileTaskProxyless` 任务，并将返回 token 交给网站原有回调；网站启用提交按钮后才继续提交牌谱。不会硬改按钮状态来假装验证成功。
+
+每个座位最多求解一次，每份牌谱默认最多四次；创建任务失败或响应不明时不会自动重复创建。账户余额不足、超时、缺少回调或网站不接受结果时，停止后续座位并返回原因。取消或超时不会保证退费，已创建的任务仍可能产生费用。`twocaptcha_max_tasks=1` 可将每份牌谱的付费任务上限降为一次，但后续座位如再次要求验证会停止。
+
+已通过模拟 API 与真实 Chromium 的回调提交流程测试；未使用真实 API Key 进行付费线上验证，不能保证站点接受每次求解结果。
 
 ## 网络和验证限制
 
 需要能访问 `mjai.ekyu.moe`；其验证组件使用 `challenges.cloudflare.com`。用户提供的牌谱由 Mortal 网站获取，本插件不通过牌谱屋查询，因此不需要牌谱屋访问 token，也不需要 Mortal 模型权重。
 
-Mortal 网站的人机验证可能阻止自动提交。插件会返回实际错误；在其他浏览器中通过验证不保证当前自动化浏览器会话也被放行。若网站限制自动访问，应遵守站方要求。本地模拟测试通过不代表已经取得真实线上评分。
+Mortal 网站的人机验证可能阻止自动提交。可按上节配置 2Captcha，插件会返回实际错误；在其他浏览器中通过验证不保证当前自动化浏览器会话也被放行。若网站限制自动访问，应遵守站方要求。本地模拟测试通过不代表已经取得真实线上评分。
 
 ## 开发验证
 

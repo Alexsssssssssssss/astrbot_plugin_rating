@@ -78,3 +78,32 @@ async def test_tenhou_post_is_bound_to_exact_log_and_seat(game, html_report, mon
         assert result['rating'] == 90.25 and result['log_id'] == log_id
         assert not browser.context.pages
 
+
+async def test_2captcha_callback_then_official_submission(game, html_report, monkeypatch):
+    from mortal.captcha import TurnstileSolver
+    monkeypatch.setenv('MORTAL_INTERVAL', '0')
+    monkeypatch.setenv('MORTAL_TIMEOUT', '5')
+    calls = []
+    solver = TurnstileSolver('test-not-real')
+    async def solve(parameters, cancelled):
+        calls.append(parameters)
+        assert parameters['sitekey'] == 'test-public-sitekey'
+        return 'test-response-token'
+    monkeypatch.setattr(solver, 'solve', solve)
+    html = OFFICIAL_FORM + '''<script>
+    window.turnstile = {render: () => 'widget'};
+    turnstile.render(document.body, {sitekey: 'test-public-sitekey',
+      callback: token => {
+        document.querySelector('button[name="submitBtn"]').disabled = false;
+      }});
+    </script>'''
+    async with MortalBrowser(captcha_solver=solver) as browser:
+        async def handle(route):
+            if route.request.method == 'POST':
+                assert b'test-response-token' in route.request.post_data_buffer
+                await route.fulfill(content_type='text/html', body=html_report)
+            else:
+                await route.fulfill(content_type='text/html', body=html)
+        await browser.context.route('https://mjai.ekyu.moe/**', handle)
+        result, _ = await browser.analyze(game)
+        assert result['rating'] == 90.25 and len(calls) == 1

@@ -12,16 +12,18 @@ from playwright.async_api import async_playwright, Error as BrowserError
 from bs4 import BeautifulSoup
 
 from .reports import AnalysisError, parse_html_report, log_matches
+from .captcha import TURNSTILE_CAPTURE
 
 MORTAL_SITE = "https://mjai.ekyu.moe/zh-cn.html"
 MORTAL_FLOW_VERSION = "submission-diagnostics-v5"
 
 
 class MortalBrowser:
-    """串行使用官方网站表单，遇到验证立即停止，不使用未经确认的私有 API。"""
-    def __init__(self):
+    """串行使用官方网站表单，可选接入 Turnstile 求解；错误时停止。"""
+    def __init__(self, captcha_solver=None):
         self.pw = self.browser = self.context = None
         self.last_submit = 0
+        self.captcha_solver = captcha_solver
 
     async def __aenter__(self):
         self.pw = await async_playwright().start()
@@ -39,6 +41,8 @@ class MortalBrowser:
         try:
             self.browser = await self.pw.chromium.launch(**opts)
             self.context = await self.browser.new_context(locale="zh-CN", accept_downloads=True)
+            if self.captcha_solver is not None:
+                await self.context.add_init_script(TURNSTILE_CAPTURE)
             self._navigation_observer = None
             def observe_server_navigation(source, payload):
                 if self._navigation_observer is not None:
@@ -298,6 +302,9 @@ class MortalBrowser:
             stage = "填写分析表单"
             submit = await self.prepare_form(page, game)
             stage = "等待验证完成"
+            if await submit.is_disabled() and self.captcha_solver is not None:
+                stage = "2Captcha 验证"
+                await self.captcha_solver.complete(page, cancelled)
             # 等待站点自己的正常验证回调；不生成 token、不点击/破解验证控件。
             verification_deadline = time.monotonic() + int(os.getenv('MORTAL_VERIFICATION_TIMEOUT', '15'))
             while await submit.is_disabled() and time.monotonic() < verification_deadline:
@@ -305,7 +312,7 @@ class MortalBrowser:
                     raise AnalysisError('任务已取消。')
                 await asyncio.sleep(1)
             if await submit.is_disabled():
-                raise AnalysisError("Mortal 提交按钮等待 Cloudflare 人机验证，已暂停自动提交。请在原站完成正常验证后重试；本插件不绕过验证，未提交该场牌谱。")
+                raise AnalysisError("Mortal 提交按钮仍在等待 Cloudflare 人机验证，未提交该场牌谱。可在插件设置启用 2Captcha；若已启用，说明本次验证未获网站接受。")
             self.last_submit = time.monotonic()
             stage = "提交分析表单"
             # The click timeout must not cover the server's analysis/queue wait.

@@ -1,4 +1,25 @@
 {
+  "captcha_provider": {
+    "description": "验证方式：manual 或 2captcha（付费服务）",
+    "type": "string",
+    "default": "manual",
+    "options": ["manual", "2captcha"]
+  },
+  "twocaptcha_api_key": {
+    "description": "2Captcha API Key（勿发到群聊；也可用 TWOCAPTCHA_API_KEY 环境变量）",
+    "type": "string",
+    "default": ""
+  },
+  "twocaptcha_timeout": {
+    "description": "2Captcha 求解等待时间（秒，10–600）",
+    "type": "int",
+    "default": 180
+  },
+  "twocaptcha_max_tasks": {
+    "description": "每份牌谱最多创建的付费验证任务数（1–4）",
+    "type": "int",
+    "default": 4
+  },
   "auto_detect": {
     "description": "自动识别直接发送的牌谱链接",
     "type": "bool",

@@ -1,5 +1,6 @@
 """AstrBot + OneBot v11/NapCat 牌谱 Rating 插件。"""
 import asyncio
+import os
 import time
 
 from astrbot.api import AstrBotConfig, logger
@@ -8,17 +9,32 @@ from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star, register
 
 from .mortal.service import RatingService, parse_record
+from .mortal.browser import MortalBrowser
+from .mortal.captcha import TurnstileSolver
+from .mortal.reports import AnalysisError
 
 
-@register("astrbot_plugin_rating", "Alexsssssssssssss", "雀魂/天凤 Mortal Rating 查询", "1.0.0")
+@register("astrbot_plugin_rating", "Alexsssssssssssss", "雀魂/天凤 Mortal Rating 查询", "1.1.0")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.service = RatingService(max_pending=int(config.get("max_pending", 3)))
+        self.service = RatingService(browser_factory=self._make_browser,
+                                     max_pending=int(config.get("max_pending", 3)))
         self.last_query = {}
         self.tasks = set()
         self.closed = False
+
+    def _make_browser(self):
+        provider = self.config.get("captcha_provider", "manual")
+        if provider == "manual":
+            return MortalBrowser()
+        if provider != "2captcha":
+            raise AnalysisError("captcha_provider 必须为 manual 或 2captcha。")
+        key = os.getenv("TWOCAPTCHA_API_KEY") or self.config.get("twocaptcha_api_key", "")
+        return MortalBrowser(captcha_solver=TurnstileSolver(
+            key, timeout=self.config.get("twocaptcha_timeout", 180),
+            max_tasks=self.config.get("twocaptcha_max_tasks", 4)))
 
     async def initialize(self):
         logger.info("Rating 插件已加载；使用 /rating 牌谱链接，默认分析四个座位。")

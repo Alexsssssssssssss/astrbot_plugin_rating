@@ -1,0 +1,17 @@
+{
+  "auto_detect": {
+    "description": "自动识别直接发送的牌谱链接",
+    "type": "bool",
+    "default": true
+  },
+  "cooldown_seconds": {
+    "description": "同一用户的提交冷却时间（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "max_pending": {
+    "description": "同时容纳的分析任务总数（含正在运行的任务）",
+    "type": "int",
+    "default": 3
+  }
+}

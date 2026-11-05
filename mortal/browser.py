@@ -1,0 +1,414 @@
+import asyncio
+import os
+import re
+import shutil
+import time
+from pathlib import Path
+from email.parser import BytesParser
+from email.policy import default as email_policy
+from urllib.parse import parse_qs, quote, urlsplit, urljoin, urldefrag
+
+from playwright.async_api import async_playwright, Error as BrowserError
+from bs4 import BeautifulSoup
+
+from .reports import AnalysisError, parse_html_report, log_matches
+
+MORTAL_SITE = "https://mjai.ekyu.moe/zh-cn.html"
+MORTAL_FLOW_VERSION = "submission-diagnostics-v5"
+
+
+class MortalBrowser:
+    """串行使用官方网站表单，遇到验证立即停止，不使用未经确认的私有 API。"""
+    def __init__(self):
+        self.pw = self.browser = self.context = None
+        self.last_submit = 0
+
+    async def __aenter__(self):
+        self.pw = await async_playwright().start()
+        opts = {"headless": os.getenv("MORTAL_HEADLESS", "1") != "0"}
+        executable = os.getenv("CHROMIUM_PATH") or shutil.which("chromium") or shutil.which("google-chrome")
+        if executable:
+            opts["executable_path"] = executable
+        proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+        if proxy:
+            p = urlsplit(proxy)
+            opts["proxy"] = {"server": f"{p.scheme}://{p.hostname}:{p.port or 80}"}
+            if p.username:
+                from urllib.parse import unquote
+                opts["proxy"].update(username=unquote(p.username), password=unquote(p.password or ""))
+        try:
+            self.browser = await self.pw.chromium.launch(**opts)
+            self.context = await self.browser.new_context(locale="zh-CN", accept_downloads=True)
+            self._navigation_observer = None
+            def observe_server_navigation(source, payload):
+                if self._navigation_observer is not None:
+                    self._navigation_observer(payload)
+            await self.context.expose_binding("__ratingServerNavigation", observe_server_navigation)
+            await self.context.add_init_script(r"""(() => {
+              if (location.hostname !== 'mjai.ekyu.moe') return;
+              const seen = new Set();
+              const scan = () => {
+                for (const meta of document.querySelectorAll('meta[http-equiv]')) {
+                  if (meta.httpEquiv.toLowerCase() !== 'refresh') continue;
+                  const refresh = meta.content;
+                  if (seen.has(refresh)) continue;
+                  seen.add(refresh);
+                  window.__ratingServerNavigation({url: location.href, refresh}).catch(() => {});
+                }
+              };
+              new MutationObserver(scan).observe(document, {subtree: true, childList: true, attributes: true});
+              document.addEventListener('DOMContentLoaded', scan);
+            })();""")
+        except BrowserError as exc:
+            await self.pw.stop()
+            raise AnalysisError("Chromium 无法启动。请安装系统 Chromium 或运行 python -m playwright install chromium。") from exc
+        return self
+
+    async def __aexit__(self, *args):
+        try:
+            if self.browser:
+                await self.browser.close()
+        except BrowserError:
+            pass
+        finally:
+            if self.pw:
+                await self.pw.stop()
+
+    async def prepare_form(self, page, game):
+        """已在官方网站核对的 reviewForm 控件；不操作派遣个室表单。"""
+        official = page.locator('form[name="reviewForm"]')
+        form = official if await official.count() == 1 else page
+        selector = os.getenv("MORTAL_URL_SELECTOR")
+        field = form.locator(selector or 'input[name="log-url"]')
+        if await field.count() != 1 and not selector:
+            field = form.locator('input[type="url"]')
+        if await field.count() != 1:
+            raise AnalysisError("无法唯一识别 Mortal 的牌谱链接输入框；网站表单可能更新。可配置 MORTAL_URL_SELECTOR 后重试。")
+        await field.fill(game["record_url"])
+        if await official.count() == 1:
+            await form.locator('select[name="player-id"]').select_option(str(game['seat']))
+            await form.locator('select[name="engine"]').select_option('mortal')
+            await form.locator('select[name="ui"]').select_option('classic')
+            await form.locator('select[name="lang"]').select_option('zh-CN')
+            model = os.getenv('MORTAL_MODEL_TAG', '4.1b')
+            if model not in ('4.1a', '4.1b', '4.1c', '4.0', '3.0'):
+                raise AnalysisError('MORTAL_MODEL_TAG 不属于官网支持的模型。')
+            await form.locator('select[name="mortal-model-tag"]').select_option(model)
+            # Rating 位于折叠的高级选项中，需要先展开再勾选。
+            await form.get_by_text('高级选项', exact=True).click()
+            await form.locator('input[name="show-rating"]').check()
+        else:
+            checkbox = form.get_by_label(re.compile(r"(?:显示|show).*rating", re.I))
+            if await checkbox.count() == 1:
+                await checkbox.check()
+        selector = os.getenv("MORTAL_SUBMIT_SELECTOR")
+        submit = form.locator(selector or 'button[type="submit"], input[type="submit"]')
+        if await submit.count() != 1:
+            raise AnalysisError("无法唯一识别 Mortal 提交按钮。可配置 MORTAL_SUBMIT_SELECTOR 后重试。")
+        return submit
+
+    @staticmethod
+    def submission_matches(request, game):
+        """Bind a document response to the exact official POST and redirects."""
+        current = request
+        while current is not None:
+            url = urlsplit(current.url)
+            if url.scheme != "https" or url.netloc != "mjai.ekyu.moe":
+                return False
+            previous = current.redirected_from
+            if previous is None:
+                break
+            current = previous
+        if current is None or current.method != "POST" or url.path != "/review":
+            return False
+        content_type = current.headers.get("content-type", "")
+        body = current.post_data_buffer or b""
+        fields = {}
+        try:
+            if content_type.startswith("application/x-www-form-urlencoded"):
+                fields = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+            elif content_type.startswith("multipart/form-data"):
+                message = BytesParser(policy=email_policy).parsebytes(
+                    ("Content-Type: " + content_type + "\r\nMIME-Version: 1.0\r\n\r\n").encode() + body)
+                if not message.is_multipart():
+                    return False
+                for part in message.iter_parts():
+                    name = part.get_param("name", header="content-disposition")
+                    if name in ("log-url", "player-id", "engine"):
+                        fields.setdefault(name, []).append((part.get_payload(decode=True) or b"").decode("utf-8"))
+            else:
+                return False
+        except (ValueError, UnicodeError):
+            return False
+        return (log_matches(game["uuid"], game["record_url"])
+                and fields.get("log-url") == [game["record_url"]]
+                and fields.get("player-id") == [str(game["seat"])]
+                and fields.get("engine") == ["mortal"])
+
+    @staticmethod
+    def server_redirect_targets(response, html):
+        """Only follow explicit navigation instructions from a bound response."""
+        targets = []
+        if response.headers.get("location"):
+            targets.append(response.headers["location"])
+        refreshes = [response.headers.get("refresh", "")]
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            for meta in soup.select('meta[http-equiv]'):
+                if meta.get('http-equiv', '').casefold() == 'refresh':
+                    refreshes.append(meta.get('content', ''))
+            # Literal assignments emitted by the server, not arbitrary links,
+            # examples, user-provided URLs, or JavaScript execution.
+            for script in soup.select('script:not([src])'):
+                text = script.get_text()
+                for pattern in (
+                    r'(?:window\.)?location(?:\.href)?\s*=\s*[\"\']([^\"\']+)[\"\']',
+                    r'(?:window\.)?location\.(?:replace|assign)\(\s*[\"\']([^\"\']+)[\"\']\s*\)',
+                ):
+                    targets.extend(re.findall(pattern, text))
+        for refresh in refreshes:
+            match = re.search(r'(?:^|;)\s*url\s*=\s*(.+?)\s*$', refresh, re.I)
+            if match:
+                targets.append(match[1].strip("\"'"))
+        safe = set()
+        for target in targets:
+            absolute = urldefrag(urljoin(response.url, target.replace('\\/', '/')))[0]
+            url = urlsplit(absolute)
+            if url.scheme == 'https' and url.netloc == 'mjai.ekyu.moe' and (
+                url.path == '/review' or url.path.startswith('/review/') or url.path.startswith('/report/')
+            ):
+                safe.add(absolute)
+        return safe
+
+    @staticmethod
+    def validate_report_identity(result, html, game, bound_submission=False):
+        """Preserve a parsed report for diagnosis; never assign an unverified score."""
+        log_id = result.get("log_id")
+        if log_matches(game["uuid"], log_id):
+            return
+        if (not isinstance(log_id, str) or not log_id.strip()) and bound_submission:
+            # The report itself has no ID. Record the provenance explicitly:
+            # identity comes from the actual POST response, not invented metadata.
+            result["log_id"] = game["uuid"]
+            result["identity_method"] = "official-post-response"
+            result["submitted_record_url"] = game["record_url"]
+            return
+        root = Path(os.getenv("RATING_DATA_DIR", ".data")).resolve() / "reports"
+        # Use a generated name, never untrusted game identifiers as a path.
+        path = root / f"unverified-{time.time_ns()}.html"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            path.write_text(html, encoding="utf-8")
+        except OSError:
+            saved = "报告保存失败，请检查数据目录写入权限。"
+        else:
+            saved = f"完整报告已保存到：{path}。"
+        if not isinstance(log_id, str) or not log_id.strip():
+            raise AnalysisError("Mortal 报告缺少牌谱 ID（log_id），尚不能确认所属比赛；这不等于报告来自另一场。"
+                                + saved + "需要带原始 ref 的独立牌谱进行完整内容校验，未录入评分。")
+        raise AnalysisError("Mortal 报告中的牌谱 ID 与当前比赛不同，拒绝录入评分。" + saved)
+
+    async def analyze(self, game, cancelled=lambda: False):
+        if game["masked"]:
+            raise AnalysisError("牌谱屋隐藏了该场 UUID，原站也未提供 AI 检讨入口；无法自动提交 Mortal。")
+        # Mortal 上游当前仅支持四人南；东场保留在最新 x 场中并清楚标注。
+        if game["mode_id"] in (8, 11, 15):
+            raise AnalysisError("当前 mjai-reviewer Mortal 引擎仅支持四人南；该四人东场保留在结果中但不伪造评分。")
+        delay = max(0, float(os.getenv("MORTAL_INTERVAL", "15")) - (time.monotonic() - self.last_submit))
+        while delay > 0:
+            if cancelled():
+                raise AnalysisError("任务已取消。")
+            await asyncio.sleep(min(1, delay))
+            delay -= 1
+        page = await self.context.new_page()
+        responses = []
+        linked_targets = set()
+        bodies = {}
+        captures = set()
+        async def capture_body(response):
+            try:
+                body = await response.text()
+                bodies[response] = body
+                if self.submission_matches(response.request, game) or urldefrag(response.url)[0] in linked_targets:
+                    linked_targets.update(self.server_redirect_targets(response, body))
+            except BrowserError:
+                pass
+        def track_response(response):
+            # Read navigation instructions immediately, before a refresh drops
+            # the previous document from the browser's resource buffer.
+            if response.request.is_navigation_request():
+                responses.append(response)
+                bound = self.submission_matches(response.request, game)
+                bound = bound or urldefrag(response.url)[0] in linked_targets
+                if bound:
+                    linked_targets.update(self.server_redirect_targets(response, ""))
+                if 200 <= response.status < 300:
+                    task = asyncio.create_task(capture_body(response))
+                    captures.add(task)
+                    task.add_done_callback(captures.discard)
+        self.context.on("response", track_response)
+        meta_snapshots = []
+        def observe_meta(payload):
+            if isinstance(payload, dict) and isinstance(payload.get('url'), str) and isinstance(payload.get('refresh'), str):
+                meta_snapshots.append(payload)
+        self._navigation_observer = observe_meta
+        stage = "打开网站"
+        def save_navigation(error=None):
+            import json
+            diagnostics = []
+            for response in responses:
+                request = response.request
+                url = urlsplit(response.url)
+                diagnostics.append({"method": request.method, "host": url.hostname,
+                    "path": url.path, "status": response.status,
+                    "post_matches": self.submission_matches(request, game),
+                    "linked_by_server": urldefrag(response.url)[0] in linked_targets})
+            # Never write request bodies, query strings, cookies or raw exception
+            # messages: Playwright call logs may contain credential-bearing URLs.
+            payload = {"version": MORTAL_FLOW_VERSION, "stage": stage,
+                       "responses": diagnostics}
+            if error is not None:
+                message = str(error).lower()
+                reason = "浏览器操作失败"
+                if "timeout" in message:
+                    reason = "等待超时"
+                elif "closed" in message:
+                    reason = "浏览器页面或驱动连接已关闭"
+                payload.update(error_type=type(error).__name__, reason=reason)
+            root = Path(os.getenv("RATING_DATA_DIR", ".data")).resolve() / "reports"
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                path = root / f"navigation-{time.time_ns()}.json"
+                path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                return path, payload.get("reason", "")
+            except OSError:
+                return None, payload.get("reason", "")
+        try:
+            target = f"{MORTAL_SITE}?url={quote(game['record_url'], safe='')}"
+            try:
+                response = await page.goto(target, wait_until="domcontentloaded", timeout=45000)
+            except BrowserError as exc:
+                save_navigation(exc)
+                if "ERR_CERT_AUTHORITY_INVALID" in str(exc):
+                    raise AnalysisError("Chromium 尚未信任此云环境的代理 CA，TLS 校验失败；需要经授权配置证书信任后重试。") from exc
+                raise AnalysisError("无法打开 Mortal 网站。请检查网络策略及 mjai.ekyu.moe 域名放行。") from exc
+            if response and response.status >= 400:
+                raise AnalysisError(f"Mortal 网站返回 HTTP {response.status}。")
+            await page.wait_for_timeout(1000)
+            stage = "填写分析表单"
+            submit = await self.prepare_form(page, game)
+            stage = "等待验证完成"
+            # 等待站点自己的正常验证回调；不生成 token、不点击/破解验证控件。
+            verification_deadline = time.monotonic() + int(os.getenv('MORTAL_VERIFICATION_TIMEOUT', '15'))
+            while await submit.is_disabled() and time.monotonic() < verification_deadline:
+                if cancelled():
+                    raise AnalysisError('任务已取消。')
+                await asyncio.sleep(1)
+            if await submit.is_disabled():
+                raise AnalysisError("Mortal 提交按钮等待 Cloudflare 人机验证，已暂停自动提交。请在原站完成正常验证后重试；本插件不绕过验证，未提交该场牌谱。")
+            self.last_submit = time.monotonic()
+            stage = "提交分析表单"
+            # The click timeout must not cover the server's analysis/queue wait.
+            # Response listeners already track the exact submitted request;
+            # the following loop owns the longer analysis deadline.
+            await submit.click(no_wait_after=True)
+            stage = "接收分析报告"
+            deadline = time.monotonic() + int(os.getenv("MORTAL_TIMEOUT", "300"))
+            last_error = "未收到报告"
+            unverified = None
+            while time.monotonic() < deadline:
+                if cancelled():
+                    raise AnalysisError("任务已取消。")
+                # Snapshot meta refresh before the old document is discarded;
+                # trust it only if its source response traces to this submission.
+                for response in list(responses):
+                    source_bound = self.submission_matches(response.request, game)
+                    source_bound = source_bound or urldefrag(response.url)[0] in linked_targets
+                    if not source_bound or response.status >= 400:
+                        continue
+                    for snapshot in meta_snapshots:
+                        if snapshot['url'] == response.url:
+                            from types import SimpleNamespace
+                            captured = SimpleNamespace(url=response.url, headers={'refresh': snapshot['refresh']})
+                            linked_targets.update(self.server_redirect_targets(captured, ''))
+                # Parse the precise HTTP response first, including popup and
+                # redirect navigation. Never infer provenance from tab order.
+                for response in list(responses):
+                    try:
+                        bound = self.submission_matches(response.request, game)
+                        bound = bound or urldefrag(response.url)[0] in linked_targets
+                        if not bound or response.status >= 400:
+                            continue
+                        html = ""
+                        if 200 <= response.status < 300:
+                            if response not in bodies:
+                                bodies[response] = await response.text()
+                            html = bodies[response]
+                        linked_targets.update(self.server_redirect_targets(response, html))
+                        if response.status != 200:
+                            continue
+                        result = parse_html_report(html, game["seat"])
+                        self.validate_report_identity(result, html, game, True)
+                        result['requested_model'] = os.getenv('MORTAL_MODEL_TAG', '4.1b')
+                        result['report_url'] = response.url
+                        return result, html
+                    except AnalysisError as exc:
+                        last_error = str(exc)
+                        if any(s in last_error for s in ("未公开 Rating", "与目标用户不符", "牌谱 ID 与当前比赛不同")):
+                            raise
+                    except BrowserError:
+                        continue
+                # Legacy reports with explicit IDs remain valid. Missing IDs
+                # wait for the response event instead of failing in a popup race.
+                for p in self.context.pages:
+                    for frame in p.frames:
+                        try:
+                            html = await frame.content()
+                            result = parse_html_report(html, game["seat"])
+                            if not result.get("log_id"):
+                                unverified = (result, html)
+                                continue
+                            self.validate_report_identity(result, html, game)
+                            result['requested_model'] = os.getenv('MORTAL_MODEL_TAG', '4.1b')
+                            if urlsplit(frame.url).netloc == 'mjai.ekyu.moe':
+                                result['report_url'] = frame.url
+                            return result, html
+                        except AnalysisError as exc:
+                            last_error = str(exc)
+                            if any(s in last_error for s in ("未公开 Rating", "与目标用户不符", "无法与当前比赛匹配", "缺少牌谱 ID", "牌谱 ID 与当前比赛不同")):
+                                raise
+                        except BrowserError:
+                            continue
+                try:
+                    text = await page.locator("body").inner_text(timeout=2000)
+                except BrowserError:
+                    # A transient refresh must not terminate report collection.
+                    await asyncio.sleep(1)
+                    continue
+                if re.search(r"验证码|人机验证|too many requests|rate limit|access denied|captcha", text, re.I):
+                    raise AnalysisError("Mortal 要求人机验证或触发限流；已暂停自动访问，请在原站完成验证或稍后重试。")
+                await asyncio.sleep(2)
+            if unverified is not None:
+                save_navigation()
+                self.validate_report_identity(unverified[0], unverified[1], game)
+            saved, _ = save_navigation()
+            location = f"诊断已保存到：{saved}。" if saved else "诊断保存失败，请检查数据目录写入权限。"
+            raise AnalysisError(f"Mortal 分析超时：{last_error}。{location}")
+        except BrowserError as exc:
+            saved, reason = save_navigation(exc)
+            location = f"诊断已保存到：{saved}。" if saved else "诊断保存失败，请检查数据目录写入权限。"
+            raise AnalysisError(f"Mortal 在“{stage}”阶段{reason}。{location}") from exc
+        finally:
+            self._navigation_observer = None
+            self.context.remove_listener("response", track_response)
+            pending_captures = list(captures)
+            for task in pending_captures:
+                task.cancel()
+            if pending_captures:
+                await asyncio.gather(*pending_captures, return_exceptions=True)
+            # 任务之间关闭所有页面，防止把上一场报告误当作新结果。
+            for p in list(self.context.pages):
+                try:
+                    await p.close()
+                except BrowserError:
+                    pass

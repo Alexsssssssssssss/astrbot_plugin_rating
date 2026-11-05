@@ -1,24 +1,86 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+"""AstrBot + OneBot v11/NapCat 牌谱 Rating 插件。"""
+import asyncio
+import time
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import At, Plain
+from astrbot.api.star import Context, Star, register
+
+from .mortal.service import RatingService, parse_record
+
+
+@register("astrbot_plugin_rating", "Alexsssssssssssss", "雀魂/天凤 Mortal Rating 查询", "1.0.0")
 class MyPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
+        self.service = RatingService(max_pending=int(config.get("max_pending", 3)))
+        self.last_query = {}
+        self.tasks = set()
+        self.closed = False
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        logger.info("Rating 插件已加载；使用 /rating 牌谱链接，默认分析四个座位。")
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+    async def _query(self, event):
+        if self.closed:
+            yield event.plain_result("插件正在卸载，请稍后重试。")
+            return
+        try:
+            record = parse_record(event.message_str)
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        cooldown = max(0, int(self.config.get("cooldown_seconds", 60)))
+        now = time.monotonic()
+        self.last_query = {k: v for k, v in self.last_query.items() if now - v < cooldown}
+        user = str(event.get_sender_id())
+        if user in self.last_query:
+            yield event.plain_result(f"每位用户每 {cooldown} 秒可提交一次，请稍后再试。")
+            return
+        if self.service.pending >= self.service.max_pending:
+            yield event.plain_result("分析队列已满，请稍后重试。")
+            return
+        self.last_query[user] = now
+        task = asyncio.create_task(self.service.analyze(record))
+        self.tasks.add(task)
+        try:
+            yield event.plain_result("已收到牌谱，等待串行分析四个座位，可能需要数分钟。")
+            try:
+                result = await task
+            except Exception:
+                # Playwright 原始异常可能含完整请求参数，不转发给群聊。
+                logger.error("Rating 分析发生内部错误，请检查浏览器安装和服务配置。")
+                result = "分析服务发生内部错误，请管理员检查浏览器和依赖配置。"
+            if event.get_group_id():
+                yield event.chain_result([At(qq=event.get_sender_id()), Plain(text='\n' + result)])
+            else:
+                yield event.plain_result(result)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self.tasks.discard(task)
+
+    @filter.command("rating")
+    async def rating(self, event: AstrMessageEvent):
+        """发送 /rating 雀魂或天凤牌谱链接，查询桌上四人的 Rating。"""
+        async for result in self._query(event):
+            yield result
+
+    @filter.regex(r"^https://(?:game\.maj-soul\.com|mahjongsoul\.game\.yo-star\.com|game\.mahjongsoul\.com|tenhou\.net)/")
+    async def record_link(self, event: AstrMessageEvent):
+        """识别直接发送的牌谱链接；可在插件设置中关闭。"""
+        if self.config.get("auto_detect", True):
+            async for result in self._query(event):
+                yield result
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        self.closed = True
+        tasks = list(self.tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.tasks.clear()

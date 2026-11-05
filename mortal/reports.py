@@ -1,5 +1,6 @@
 """严格解析 mjai-reviewer 原始 JSON / HTML，不猜测不存在的 Rating。"""
 import math
+import json
 import re
 
 from bs4 import BeautifulSoup
@@ -8,6 +9,42 @@ from urllib.parse import parse_qs, urlsplit
 
 class AnalysisError(Exception):
     pass
+
+
+class ReportError(AnalysisError):
+    """服务器明确返回的终止错误，不应重试解析直到超时。"""
+
+
+def parse_report_payload(content, expected_seat=None):
+    if content.lstrip().startswith(('{', '[')):
+        try:
+            data = json.loads(content)
+        except ValueError as exc:
+            raise ReportError('网站返回的报告 JSON 无法解析。') from exc
+        if not isinstance(data, dict):
+            raise ReportError('网站返回的报告 JSON 结构不正确。')
+        try:
+            return parse_json_report(data, expected_seat)
+        except AnalysisError as exc:
+            raise ReportError(str(exc)) from exc
+    soup = BeautifulSoup(content, 'html.parser')
+    heading = soup.title.get_text(' ', strip=True) if soup.title else ''
+    h1 = soup.find('h1')
+    if h1:
+        heading += ' ' + h1.get_text(' ', strip=True)
+    text = soup.get_text(' ', strip=True).casefold()
+    if re.search(r'error|错误|出错|failed', heading, re.I):
+        if any(word in text for word in ('captcha', 'turnstile', '验证码', '验证失败')):
+            raise ReportError('Mortal 返回验证失败页面，本次验证结果未被网站接受。')
+        raise ReportError('Mortal 返回错误页面，没有生成分析报告。')
+    if soup.select_one('form[name="reviewForm"]'):
+        raise ReportError('提交后网站重新返回检讨表单，本次提交未被接受。')
+    try:
+        return parse_html_report(content, expected_seat)
+    except AnalysisError as exc:
+        if '尚未取得 Mortal 报告' not in str(exc):
+            raise ReportError(str(exc)) from exc
+        raise
 
 
 def log_matches(expected_uuid, log_id):
@@ -62,10 +99,10 @@ def parse_html_report(html, expected_seat=None):
         dd = dt.find_next_sibling("dd")
         if dd:
             fields[dt.get_text(" ", strip=True).casefold()] = dd.get_text(" ", strip=True)
-    engine = next((v for k, v in fields.items() if k in ("ai 引擎", "ai engine", "engine", "aiエンジン")), "")
+    engine = next((v for k, v in fields.items() if k in ("ai 引擎", "ai engine", "engine", "aiエンジン", "ai", "ai 엔진")), "")
     if engine.casefold() != "mortal":
         raise AnalysisError("尚未取得 Mortal 报告，或网页格式已变化。")
-    seat_text = next((v for k, v in fields.items() if k in ("玩家 id", "player id", "プレイヤー id")), "")
+    seat_text = next((v for k, v in fields.items() if k in ("玩家 id", "player id", "プレイヤー id", "プレイヤーid", "작사 id")), "")
     if not seat_text.isdigit() or (expected_seat is not None and int(seat_text) != expected_seat):
         raise AnalysisError("Mortal 报告座位无法验证或与目标用户不符。")
     if "rating" not in fields:
@@ -74,8 +111,8 @@ def parse_html_report(html, expected_seat=None):
         rating = percent(float(fields["rating"].replace("%", "")))
     except ValueError as exc:
         raise AnalysisError("无法解析报告 Rating。") from exc
-    match_text = next((v for k, v in fields.items() if k in ("ai 一致率", "ai match rate", "match rate", "ai一致率")), "")
+    match_text = next((v for k, v in fields.items() if k in ("ai 一致率", "ai match rate", "match rate", "ai一致率", "matches/total", "ai 일치율")), "")
     match = re.search(r"(\d+)\s*/\s*(\d+)", match_text)
     if not match or int(match[2]) <= 0 or int(match[1]) > int(match[2]):
         raise AnalysisError("无法解析报告一致决策数。")
-    return {"rating": rating, "agreement": int(match[1]) / int(match[2]) * 100, "total_matches": int(match[1]), "total_reviewed": int(match[2]), "bad10": None, "bad5": None, "model_tag": fields.get("model tag", "未知"), "player_id": int(seat_text), "log_id": next((v for k, v in fields.items() if k in ("牌谱 id", "log id")), None), "origin": "Mortal 网站 HTML"}
+    return {"rating": rating, "agreement": int(match[1]) / int(match[2]) * 100, "total_matches": int(match[1]), "total_reviewed": int(match[2]), "bad10": None, "bad5": None, "model_tag": fields.get("model tag", "未知"), "player_id": int(seat_text), "log_id": next((v for k, v in fields.items() if k in ("牌谱 id", "log id", "ログid", "로그 id")), None), "origin": "Mortal 网站 HTML"}

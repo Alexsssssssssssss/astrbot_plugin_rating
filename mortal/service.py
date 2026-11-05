@@ -47,6 +47,15 @@ def parse_record(text: str) -> Record:
 
 
 def player_name(html: str, seat: int) -> str:
+    if html.lstrip().startswith('{'):
+        try:
+            data = json.loads(html)
+            split_logs = data.get('split_logs') or []
+            names = split_logs[0].get('name', []) if split_logs else []
+            if len(names) == 4 and isinstance(names[seat], str) and names[seat].strip():
+                return names[seat].strip().replace('\n', ' ').replace('\r', ' ')[:80]
+        except (ValueError, AttributeError, IndexError, TypeError):
+            pass
     soup = BeautifulSoup(html, 'html.parser')
     # Classic 报告的牌谱播放器内含 Tenhou 格式 JSON（包括四名玩家）。
     for frame in soup.select('iframe[src]'):

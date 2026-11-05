@@ -40,3 +40,19 @@ def test_log_identity_exact():
     assert log_matches('uuid', 'uuid')
     assert not log_matches('uuid', 'uuid-other')
     assert not log_matches('uuid', None)
+
+
+def test_raw_json_and_english_report(report, html_report):
+    import json
+    from mortal.reports import parse_report_payload
+    assert parse_report_payload(json.dumps(report), 1)['rating'] == 90.25
+    html = html_report.replace('AI 引擎', 'AI engine').replace('玩家 ID', 'player id').replace('牌谱 ID', 'log id').replace('AI 一致率', 'matches/total')
+    assert parse_report_payload(html, 1)['total_matches'] == 2
+
+
+def test_error_pages_are_terminal():
+    from mortal.reports import parse_report_payload, ReportError
+    with pytest.raises(ReportError, match='验证失败'):
+        parse_report_payload('<title>Error</title><p>Invalid Turnstile token</p>', 1)
+    with pytest.raises(ReportError, match='未被接受'):
+        parse_report_payload('<form name="reviewForm"></form>', 1)

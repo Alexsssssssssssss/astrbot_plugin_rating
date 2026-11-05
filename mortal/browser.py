@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, quote, urlsplit, urljoin, urldefrag
 from playwright.async_api import async_playwright, Error as BrowserError
 from bs4 import BeautifulSoup
 
-from .reports import AnalysisError, parse_html_report, log_matches
+from .reports import AnalysisError, ReportError, parse_report_payload, log_matches
 from .captcha import TURNSTILE_CAPTURE
 
 MORTAL_SITE = "https://mjai.ekyu.moe/zh-cn.html"
@@ -174,6 +174,7 @@ class MortalBrowser:
                 for pattern in (
                     r'(?:window\.)?location(?:\.href)?\s*=\s*[\"\']([^\"\']+)[\"\']',
                     r'(?:window\.)?location\.(?:replace|assign)\(\s*[\"\']([^\"\']+)[\"\']\s*\)',
+                    r'window\.open\(\s*[\"\']([^\"\']+)[\"\']',
                 ):
                     targets.extend(re.findall(pattern, text))
         for refresh in refreshes:
@@ -185,9 +186,16 @@ class MortalBrowser:
             absolute = urldefrag(urljoin(response.url, target.replace('\\/', '/')))[0]
             url = urlsplit(absolute)
             if url.scheme == 'https' and url.netloc == 'mjai.ekyu.moe' and (
-                url.path == '/review' or url.path.startswith('/review/') or url.path.startswith('/report/')
+                url.path == '/review' or url.path.startswith('/review/') or url.path.startswith('/report/') or url.path.startswith('/killerducky/')
             ):
                 safe.add(absolute)
+                if url.path.startswith('/killerducky/'):
+                    data = parse_qs(url.query).get('data', [])
+                    if len(data) == 1:
+                        report_url = urljoin(absolute, data[0])
+                        report = urlsplit(report_url)
+                        if report.scheme == 'https' and report.netloc == 'mjai.ekyu.moe' and report.path.startswith('/report/'):
+                            safe.add(report_url)
         return safe
 
     @staticmethod
@@ -232,9 +240,33 @@ class MortalBrowser:
             delay -= 1
         page = await self.context.new_page()
         responses = []
+        submissions = []
+        failed_requests = []
         linked_targets = set()
         bodies = {}
         captures = set()
+        downloads = []
+        async def capture_download(download):
+            try:
+                filename = await download.path()
+                if filename is None:
+                    downloads.append((download.url, None))
+                    return
+                path = Path(filename)
+                if path.stat().st_size > 32 * 1024 * 1024:
+                    downloads.append((download.url, None))
+                    return
+                downloads.append((download.url, path.read_text(encoding='utf-8')))
+            except (BrowserError, OSError, UnicodeError):
+                downloads.append((download.url, None))
+        def track_download(download):
+            task = asyncio.create_task(capture_download(download))
+            captures.add(task)
+            task.add_done_callback(captures.discard)
+        def track_page(new_page):
+            new_page.on('download', track_download)
+        page.on('download', track_download)
+        self.context.on('page', track_page)
         async def capture_body(response):
             try:
                 body = await response.text()
@@ -246,7 +278,10 @@ class MortalBrowser:
         def track_response(response):
             # Read navigation instructions immediately, before a refresh drops
             # the previous document from the browser's resource buffer.
-            if response.request.is_navigation_request():
+            url = urlsplit(response.url)
+            report_resource = (url.scheme == 'https' and url.netloc == 'mjai.ekyu.moe'
+                               and (url.path == '/review' or url.path.startswith(('/review/', '/report/', '/killerducky/'))))
+            if response.request.is_navigation_request() or report_resource:
                 responses.append(response)
                 bound = self.submission_matches(response.request, game)
                 bound = bound or urldefrag(response.url)[0] in linked_targets
@@ -256,7 +291,18 @@ class MortalBrowser:
                     task = asyncio.create_task(capture_body(response))
                     captures.add(task)
                     task.add_done_callback(captures.discard)
+        def track_request(request):
+            if self.submission_matches(request, game):
+                submissions.append(request)
+        def track_failure(request):
+            if self.submission_matches(request, game) or urldefrag(request.url)[0] in linked_targets:
+                code = request.failure or ''
+                if not re.fullmatch(r'net::ERR_[A-Z0-9_]+', code):
+                    code = '网络请求失败'
+                failed_requests.append(code)
         self.context.on("response", track_response)
+        self.context.on("request", track_request)
+        self.context.on('requestfailed', track_failure)
         meta_snapshots = []
         def observe_meta(payload):
             if isinstance(payload, dict) and isinstance(payload.get('url'), str) and isinstance(payload.get('refresh'), str):
@@ -332,13 +378,26 @@ class MortalBrowser:
             # the following loop owns the longer analysis deadline.
             await submit.click(no_wait_after=True)
             stage = "接收分析报告"
-            self.progress("接收分析报告")
+            self.progress("已点击提交，正在确认提交请求")
+            submit_deadline = time.monotonic() + 3
+            confirmed = False
+            announced = set()
             deadline = time.monotonic() + int(os.getenv("MORTAL_TIMEOUT", "300"))
             last_error = "未收到报告"
             unverified = None
             while time.monotonic() < deadline:
                 if cancelled():
                     raise AnalysisError("任务已取消。")
+                if submissions and not confirmed:
+                    confirmed = True
+                    self.progress('已确认当前牌谱与座位的提交请求，等待网站响应')
+                if not submissions and time.monotonic() > submit_deadline:
+                    raise ReportError('点击提交后没有观察到匹配的 POST 请求，可能被表单校验或网页脚本阻止，尚不能视为已提交。')
+                for code in failed_requests:
+                    attachment = any('attachment' in r.headers.get('content-disposition', '').lower() for r in responses)
+                    if code == 'net::ERR_ABORTED' and (downloads or attachment):
+                        continue
+                    raise ReportError(f'Mortal 提交或报告网络请求失败（{code}），未取得评分；请检查浏览器网络与代理。')
                 # Snapshot meta refresh before the old document is discarded;
                 # trust it only if its source response traces to this submission.
                 for response in list(responses):
@@ -357,34 +416,60 @@ class MortalBrowser:
                     try:
                         bound = self.submission_matches(response.request, game)
                         bound = bound or urldefrag(response.url)[0] in linked_targets
-                        if not bound or response.status >= 400:
+                        source = urlsplit(response.url)
+                        explicit_report = source.scheme == 'https' and source.netloc == 'mjai.ekyu.moe' and source.path.startswith('/report/')
+                        if not bound and not explicit_report:
                             continue
+                        if response.status >= 400:
+                            if bound:
+                                raise ReportError(f'Mortal 提交或报告请求返回 HTTP {response.status}，未取得评分；已停止等待。')
+                            continue
+                        if bound and response not in announced:
+                            announced.add(response)
+                            self.progress(f'网站返回 HTTP {response.status}，正在检查报告或跳转')
                         html = ""
                         if 200 <= response.status < 300:
                             if response not in bodies:
                                 bodies[response] = await response.text()
                             html = bodies[response]
-                        linked_targets.update(self.server_redirect_targets(response, html))
+                        if bound:
+                            linked_targets.update(self.server_redirect_targets(response, html))
                         if response.status != 200:
                             continue
-                        result = parse_html_report(html, game["seat"])
-                        self.validate_report_identity(result, html, game, True)
+                        result = parse_report_payload(html, game["seat"])
+                        if not bound and not log_matches(game['uuid'], result.get('log_id')):
+                            continue
+                        self.validate_report_identity(result, html, game, bound)
                         result['requested_model'] = os.getenv('MORTAL_MODEL_TAG', '4.1b')
                         result['report_url'] = response.url
                         return result, html
                     except AnalysisError as exc:
                         last_error = str(exc)
-                        if any(s in last_error for s in ("未公开 Rating", "与目标用户不符", "牌谱 ID 与当前比赛不同")):
+                        if not bound:
+                            continue
+                        if isinstance(exc, ReportError) or any(s in last_error for s in ("未公开 Rating", "与目标用户不符", "牌谱 ID 与当前比赛不同")):
                             raise
                     except BrowserError:
                         continue
+                for download_url, content in downloads:
+                    bound = urldefrag(download_url)[0] in linked_targets or any(
+                        r.url == download_url and self.submission_matches(r.request, game) for r in responses)
+                    if not bound:
+                        continue
+                    if content is None:
+                        raise ReportError('网站返回了报告下载，但下载失败、编码无效或文件过大。')
+                    result = parse_report_payload(content, game['seat'])
+                    self.validate_report_identity(result, content, game, True)
+                    result['report_url'] = download_url
+                    result['requested_model'] = os.getenv('MORTAL_MODEL_TAG', '4.1b')
+                    return result, content
                 # Legacy reports with explicit IDs remain valid. Missing IDs
                 # wait for the response event instead of failing in a popup race.
                 for p in self.context.pages:
                     for frame in p.frames:
                         try:
                             html = await frame.content()
-                            result = parse_html_report(html, game["seat"])
+                            result = parse_report_payload(html, game["seat"])
                             if not result.get("log_id"):
                                 unverified = (result, html)
                                 continue
@@ -395,6 +480,10 @@ class MortalBrowser:
                             return result, html
                         except AnalysisError as exc:
                             last_error = str(exc)
+                            frame_bound = urldefrag(frame.url)[0] in linked_targets or any(
+                                r.url == frame.url and self.submission_matches(r.request, game) for r in responses)
+                            if isinstance(exc, ReportError) and frame_bound:
+                                raise
                             if any(s in last_error for s in ("未公开 Rating", "与目标用户不符", "无法与当前比赛匹配", "缺少牌谱 ID", "牌谱 ID 与当前比赛不同")):
                                 raise
                         except BrowserError:
@@ -406,7 +495,7 @@ class MortalBrowser:
                     await asyncio.sleep(1)
                     continue
                 if re.search(r"验证码|人机验证|too many requests|rate limit|access denied|captcha", text, re.I):
-                    raise AnalysisError("Mortal 要求人机验证或触发限流；已暂停自动访问，请在原站完成验证或稍后重试。")
+                    raise AnalysisError("Mortal 返回验证失败、人机验证或限流提示；未取得报告，已停止后续访问。")
                 await asyncio.sleep(2)
             if unverified is not None:
                 save_navigation()
@@ -421,6 +510,9 @@ class MortalBrowser:
         finally:
             self._navigation_observer = None
             self.context.remove_listener("response", track_response)
+            self.context.remove_listener("request", track_request)
+            self.context.remove_listener('requestfailed', track_failure)
+            self.context.remove_listener('page', track_page)
             pending_captures = list(captures)
             for task in pending_captures:
                 task.cancel()

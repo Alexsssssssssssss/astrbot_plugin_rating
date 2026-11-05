@@ -50,6 +50,8 @@ Linux 缺少浏览器系统库时，按 Playwright 官方方式使用 `python -m
 | `max_pending` | `3` | 运行中与排队任务总数，实际限制为 1–20 |
 | `captcha_provider` | `manual` | 改成 `2captcha` 后启用付费 Turnstile 求解 |
 | `twocaptcha_api_key` | 空 | 2Captcha API Key，仅在管理面板填写 |
+| `twocaptcha_proxy` | 空 | 可选 HTTP 代理，例如 `http://127.0.0.1:7890` |
+| `twocaptcha_request_timeout` | `30` | 单次网络请求超时秒数，范围 5–120 |
 | `twocaptcha_timeout` | `180` | 验证任务等待秒数，范围 10–600 |
 | `twocaptcha_max_tasks` | `4` | 每份牌谱最多创建的付费任务，范围 1–4 |
 
@@ -80,6 +82,14 @@ Linux 缺少浏览器系统库时，按 Playwright 官方方式使用 `python -m
 每个座位最多求解一次，每份牌谱默认最多四次；创建任务失败或响应不明时不会自动重复创建。账户余额不足、超时、缺少回调或网站不接受结果时，停止后续座位并返回原因。取消或超时不会保证退费，已创建的任务仍可能产生费用。`twocaptcha_max_tasks=1` 可将每份牌谱的付费任务上限降为一次，但后续座位如再次要求验证会停止。
 
 已通过模拟 API 与真实 Chromium 的回调提交流程测试；未使用真实 API Key 进行付费线上验证，不能保证站点接受每次求解结果。
+
+### 请求失败排查（v1.1.1）
+
+v1.1.1 会区分创建任务失败与查询结果失败，显示连接超时、读取超时、代理故障、HTTP 状态、无效 JSON 或 TLS 证书校验错误，不输出 API Key、代理密码或接口响应正文。
+
+若 AstrBot 所在网络需要代理，在插件设置的“2Captcha HTTP 代理”填写实际 HTTP 代理地址。插件无法自动读取另一个应用或 AstrBot 面板中的代理设置；留空时沿用进程的 `HTTP_PROXY`/`HTTPS_PROXY` 等标准环境设置。`http://127.0.0.1:7890` 只是格式示例，应改成你实际的 HTTP 代理端口，且本机地址指 AstrBot 所在的电脑/容器。单次请求较慢时可将“2Captcha 单次网络请求超时”调为 `60`，这与验证码求解等待时间不同。
+
+如果返回 `ERROR_KEY_DOES_NOT_EXIST` 或 `ERROR_ZERO_BALANCE` 等服务错误，按对应账户问题处理；出现连接失败不等于密钥或余额有问题。先查看 2Captcha 账户任务记录，避免对可能已创建的任务重复付费。
 
 ## 网络和验证限制
 

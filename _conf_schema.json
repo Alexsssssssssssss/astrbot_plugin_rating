@@ -10,6 +10,16 @@
     "type": "string",
     "default": ""
   },
+  "twocaptcha_proxy": {
+    "description": "2Captcha HTTP 代理（可选，如 http://127.0.0.1:7890；必须是运行 AstrBot 的环境可访问的地址）",
+    "type": "string",
+    "default": ""
+  },
+  "twocaptcha_request_timeout": {
+    "description": "2Captcha 单次网络请求超时（秒，5–120）",
+    "type": "int",
+    "default": 30
+  },
   "twocaptcha_timeout": {
     "description": "2Captcha 求解等待时间（秒，10–600）",
     "type": "int",

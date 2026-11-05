@@ -1,12 +1,40 @@
 """可选的 2Captcha Turnstile 接入；每次求解最多创建一个付费任务。"""
 import asyncio
+import ssl
 import time
+from urllib.parse import urlsplit
 
 import httpx
 
 from .reports import AnalysisError
 
 API = "https://api.2captcha.com"
+
+
+def request_failure(exc):
+    """仅返回固定分类，不输出异常原文、代理密码或响应内容。"""
+    cause = exc
+    for _ in range(10):
+        if isinstance(cause, ssl.SSLCertVerificationError):
+            return 'TLS 证书校验失败，请检查系统证书和代理证书信任'
+        cause = getattr(cause, '__cause__', None)
+        if cause is None:
+            break
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f'接口返回 HTTP {exc.response.status_code}'
+    if isinstance(exc, httpx.ProxyError):
+        return '代理连接失败，请检查插件的 2Captcha HTTP 代理设置'
+    if isinstance(exc, httpx.ConnectTimeout):
+        return '连接 api.2captcha.com 超时，请检查网络或配置 2Captcha HTTP 代理'
+    if isinstance(exc, httpx.ReadTimeout):
+        return '等待 api.2captcha.com 响应超时'
+    if isinstance(exc, httpx.ConnectError):
+        return '无法连接 api.2captcha.com，请检查域名解析、网络和代理'
+    if isinstance(exc, httpx.TimeoutException):
+        return '接口请求超时'
+    if isinstance(exc, ValueError):
+        return '接口返回了非 JSON 或无效 JSON，可能被网关拦截'
+    return '接口连接中断或协议错误'
 
 # Install before navigation so the site's actual callback is retained. No changes
 # to browser fingerprints, challenge scripts, or the site's validation rules.
@@ -49,7 +77,8 @@ async def _pause(seconds, cancelled):
         await asyncio.sleep(min(.5, max(0, end - time.monotonic())))
 
 
-async def solve(parameters, cancelled=lambda: False, transport=None, *, api_key, timeout=180):
+async def solve(parameters, cancelled=lambda: False, transport=None, *, api_key, timeout=180,
+                proxy=None, request_timeout=30):
     """One paid task at most. Never retry task creation on uncertain responses."""
     key = api_key.strip()
     if not key:
@@ -60,7 +89,8 @@ async def solve(parameters, cancelled=lambda: False, transport=None, *, api_key,
         if parameters.get(name):
             task[name] = parameters[name]
     deadline = time.monotonic() + max(10, min(600, int(timeout)))
-    async with httpx.AsyncClient(timeout=30, follow_redirects=False, transport=transport) as client:
+    async with httpx.AsyncClient(timeout=request_timeout, proxy=proxy or None,
+                                 follow_redirects=False, transport=transport) as client:
         async def request(path, payload):
             try:
                 response = await client.post(API + path, json=payload)
@@ -69,7 +99,9 @@ async def solve(parameters, cancelled=lambda: False, transport=None, *, api_key,
                 if not isinstance(body, dict):
                     raise ValueError()
             except (httpx.HTTPError, ValueError) as exc:
-                raise AnalysisError("2Captcha 请求失败；未自动重试创建任务，请检查服务连接与账户任务记录。") from exc
+                stage = '创建任务' if path == '/createTask' else '查询结果'
+                raise AnalysisError(f"2Captcha {stage}失败：{request_failure(exc)}。"
+                                    "未重复创建付费任务；请先查看账户任务记录再重试。") from exc
             if body.get("errorId"):
                 # Only expose documented code-like identifiers; descriptions can
                 # echo request data and must never appear in saved task errors.
@@ -152,19 +184,30 @@ async def complete(page, cancelled=lambda: False, *, solver):
 
 
 class TurnstileSolver:
-    def __init__(self, api_key, timeout=180, max_tasks=4):
+    def __init__(self, api_key, timeout=180, max_tasks=4, proxy='', request_timeout=30):
         if not api_key.strip():
             raise AnalysisError("已启用 2Captcha，请在插件设置填写 API Key 或设置 TWOCAPTCHA_API_KEY。")
         self._api_key = api_key.strip()
         self.timeout = max(10, min(600, int(timeout)))
         self.max_tasks = max(1, min(4, int(max_tasks)))
         self.tasks_created = 0
+        self.proxy = proxy.strip()
+        if self.proxy:
+            try:
+                url = urlsplit(self.proxy)
+                valid = url.scheme in ('http', 'https') and url.hostname and url.port
+            except ValueError:
+                valid = False
+            if not valid:
+                raise AnalysisError('2Captcha HTTP 代理格式错误，请填写 http://主机:端口。')
+        self.request_timeout = max(5, min(120, int(request_timeout)))
 
     async def solve(self, parameters, cancelled=lambda: False):
         if self.tasks_created >= self.max_tasks:
             raise AnalysisError("本次牌谱已达到 2Captcha 付费任务上限，已停止后续分析。")
         self.tasks_created += 1
-        return await solve(parameters, cancelled, api_key=self._api_key, timeout=self.timeout)
+        return await solve(parameters, cancelled, api_key=self._api_key, timeout=self.timeout,
+                           proxy=self.proxy, request_timeout=self.request_timeout)
 
     async def complete(self, page, cancelled=lambda: False):
         return await complete(page, cancelled, solver=self.solve)

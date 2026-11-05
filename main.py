@@ -14,7 +14,7 @@ from .mortal.captcha import TurnstileSolver
 from .mortal.reports import AnalysisError
 
 
-@register("astrbot_plugin_rating", "Alexsssssssssssss", "雀魂/天凤 Mortal Rating 查询", "1.1.0")
+@register("astrbot_plugin_rating", "Alexsssssssssssss", "雀魂/天凤 Mortal Rating 查询", "1.1.1")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -34,7 +34,9 @@ class MyPlugin(Star):
         key = os.getenv("TWOCAPTCHA_API_KEY") or self.config.get("twocaptcha_api_key", "")
         return MortalBrowser(captcha_solver=TurnstileSolver(
             key, timeout=self.config.get("twocaptcha_timeout", 180),
-            max_tasks=self.config.get("twocaptcha_max_tasks", 4)))
+            max_tasks=self.config.get("twocaptcha_max_tasks", 4),
+            proxy=self.config.get("twocaptcha_proxy", ''),
+            request_timeout=self.config.get("twocaptcha_request_timeout", 30)))
 
     async def initialize(self):
         logger.info("Rating 插件已加载；使用 /rating 牌谱链接，默认分析四个座位。")

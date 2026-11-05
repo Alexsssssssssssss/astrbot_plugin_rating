@@ -96,3 +96,55 @@ async def test_paid_task_budget(monkeypatch):
     with pytest.raises(AnalysisError, match='上限'):
         await solver.solve({})
     assert len(seen) == 1
+
+
+@pytest.mark.parametrize('kind, expected', [
+    ('connect_timeout', '连接 api.2captcha.com 超时'),
+    ('read_timeout', '响应超时'),
+    ('proxy', '代理连接失败'),
+    ('connect', '无法连接'),
+    ('http', 'HTTP 403'),
+    ('html', '非 JSON'),
+    ('tls', 'TLS 证书校验失败'),
+])
+async def test_safe_request_diagnostics(configured, kind, expected):
+    import ssl
+    calls = []
+    def handle(request):
+        calls.append(request.url.path)
+        if kind == 'http':
+            return httpx.Response(403, text='secret-test-key')
+        if kind == 'html':
+            return httpx.Response(200, text='<html>secret-test-key</html>')
+        if kind == 'tls':
+            raise httpx.ConnectError('secret-test-key', request=request) from ssl.SSLCertVerificationError('secret-test-key')
+        error = {'connect_timeout': httpx.ConnectTimeout, 'read_timeout': httpx.ReadTimeout,
+                 'proxy': httpx.ProxyError, 'connect': httpx.ConnectError}[kind]
+        raise error('secret-test-key', request=request)
+    with pytest.raises(AnalysisError) as exc:
+        await captcha.solve({'url': 'https://mjai.ekyu.moe', 'sitekey': 'public'},
+            api_key='secret-test-key', transport=httpx.MockTransport(handle))
+    assert expected in str(exc.value)
+    assert '创建任务失败' in str(exc.value)
+    assert 'secret-test-key' not in str(exc.value)
+    assert calls == ['/createTask']
+
+
+async def test_polling_failure_distinguished_from_creation(configured):
+    calls = []
+    def handle(request):
+        calls.append(request.url.path)
+        if request.url.path == '/createTask':
+            return httpx.Response(200, json={'taskId': 42})
+        raise httpx.ReadTimeout('secret', request=request)
+    with pytest.raises(AnalysisError, match='查询结果失败'):
+        await captcha.solve({'url': 'https://mjai.ekyu.moe', 'sitekey': 'public'},
+            api_key='secret', transport=httpx.MockTransport(handle))
+    assert calls == ['/createTask', '/getTaskResult']
+
+
+def test_proxy_config_validation():
+    solver = captcha.TurnstileSolver('key', proxy='http://127.0.0.1:7890', request_timeout=60)
+    assert solver.proxy == 'http://127.0.0.1:7890' and solver.request_timeout == 60
+    with pytest.raises(AnalysisError, match='代理格式错误'):
+        captcha.TurnstileSolver('key', proxy='not-a-proxy')

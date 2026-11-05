@@ -98,3 +98,33 @@ async def test_queue_limit_serialization_and_cancellation():
     task.cancel()
     with pytest.raises(asyncio.CancelledError): await task
     assert service.pending == 0 and exited.is_set()
+
+
+async def test_timeout_preserves_first_seat_and_cleans_browser():
+    cleaned = []
+    class Browser:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): cleaned.append(True)
+        async def analyze(self, game):
+            if game['seat'] == 0:
+                return dict(rating=75, agreement=50, total_matches=1, total_reviewed=2), ''
+            await asyncio.Event().wait()
+    service = core.RatingService(Browser)
+    progress = []
+    record = core.parse_record('https://game.maj-soul.com/1/?paipu=260101-abcdef12')
+    result = await service.analyze(record, progress=progress.append, seat_timeout=.01)
+    assert 'Rating: 75.00' in result and '南家超过单座位' in result
+    assert any('东家分析完成' in message for message in progress)
+    assert cleaned and service.pending == 0
+
+
+async def test_overall_timeout_includes_queue_wait():
+    service = core.RatingService()
+    await service.lock.acquire()
+    record = core.parse_record('https://game.maj-soul.com/1/?paipu=260101-abcdef12')
+    try:
+        result = await service.analyze(record, total_timeout=.01)
+        assert '总等待上限' in result and '等待队列' in result
+        assert service.pending == 0
+    finally:
+        service.lock.release()

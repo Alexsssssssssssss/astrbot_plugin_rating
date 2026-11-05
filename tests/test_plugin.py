@@ -47,7 +47,7 @@ class Event:
 
 
 async def test_command_reply_cooldown_and_validation(plugin, monkeypatch):
-    async def analyze(record):
+    async def analyze(record, **kwargs):
         assert record.source == '雀魂'
         return '测试分析结果'
     monkeypatch.setattr(plugin.service, 'analyze', analyze)
@@ -62,14 +62,14 @@ async def test_command_reply_cooldown_and_validation(plugin, monkeypatch):
 async def test_disabled_detection_and_internal_errors(plugin, monkeypatch):
     plugin.config['auto_detect'] = False
     assert [r async for r in plugin.record_link(Event())] == []
-    async def fail(record): raise RuntimeError('secret-in-browser-exception')
+    async def fail(record, **kwargs): raise RuntimeError('secret-in-browser-exception')
     monkeypatch.setattr(plugin.service, 'analyze', fail)
     replies = [r async for r in plugin.rating(Event())]
     assert '内部错误' in replies[-1] and 'secret' not in replies[-1]
 
 
 async def test_group_mentions_requester(plugin, monkeypatch):
-    async def analyze(record): return '结果'
+    async def analyze(record, **kwargs): return '结果'
     monkeypatch.setattr(plugin.service, 'analyze', analyze)
     event = Event()
     event.get_group_id = lambda: '456'
@@ -94,7 +94,7 @@ def test_captcha_configuration(plugin, monkeypatch):
 async def test_terminate_cancels_active_analysis(plugin, monkeypatch):
     started = asyncio.Event()
     cleaned = asyncio.Event()
-    async def analyze(record):
+    async def analyze(record, **kwargs):
         started.set()
         try:
             await asyncio.Event().wait()
@@ -107,3 +107,61 @@ async def test_terminate_cancels_active_analysis(plugin, monkeypatch):
     await plugin.terminate()
     assert cleaned.is_set() and not plugin.tasks and plugin.closed
     await generator.aclose()
+
+
+async def test_progress_is_sent_before_analysis_finishes(plugin, monkeypatch):
+    release = asyncio.Event()
+    async def analyze(record, *, progress, **kwargs):
+        progress('东家：2Captcha 已创建任务，正在等待求解')
+        await release.wait()
+        return '完成'
+    monkeypatch.setattr(plugin.service, 'analyze', analyze)
+    stream = plugin.rating(Event())
+    assert '已收到' in await anext(stream)
+    message = await anext(stream)
+    assert '2Captcha 已创建任务' in message
+    assert plugin.user_tasks['123'] and not plugin.user_tasks['123'].done()
+    release.set()
+    assert await anext(stream) == '完成'
+    await stream.aclose()
+
+
+async def test_user_can_cancel_query(plugin, monkeypatch):
+    started = asyncio.Event()
+    async def analyze(record, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+    monkeypatch.setattr(plugin.service, 'analyze', analyze)
+    stream = plugin.rating(Event())
+    await anext(stream)
+    await started.wait()
+    assert '已有查询' in [r async for r in plugin.rating(Event())][0]
+    assert '已请求取消' in [r async for r in plugin.rating_cancel(Event())][0]
+    rest = [r async for r in stream]
+    assert '查询已取消' in rest[-1]
+    assert not plugin.tasks and not plugin.user_tasks
+
+
+async def test_heartbeat_while_waiting(plugin, monkeypatch):
+    release = asyncio.Event()
+    async def analyze(record, **kwargs):
+        await release.wait()
+        return '完成'
+    monkeypatch.setattr(plugin.service, 'analyze', analyze)
+    original = asyncio.wait_for
+    first = True
+    async def wait_for(awaitable, timeout):
+        nonlocal first
+        if first:
+            first = False
+            awaitable.close()
+            raise TimeoutError()
+        return await original(awaitable, timeout)
+    monkeypatch.setattr(asyncio, 'wait_for', wait_for)
+    stream = plugin.rating(Event())
+    await anext(stream)
+    message = await anext(stream)
+    assert '分析进度' in message and '已用时' in message
+    release.set()
+    assert await anext(stream) == '完成'
+    await stream.aclose()

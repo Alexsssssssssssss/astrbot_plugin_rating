@@ -91,29 +91,45 @@ class RatingService:
         self.max_pending = max(1, min(20, max_pending))
         self.last_submit = 0
 
-    async def analyze(self, record: Record, seats=(0, 1, 2, 3)) -> str:
+    async def analyze(self, record: Record, seats=(0, 1, 2, 3), *, progress=None,
+                      total_timeout=900, seat_timeout=360) -> str:
         if self.pending >= self.max_pending:
             return '分析队列已满，请稍后重试。'
         self.pending += 1
         lines = ['牌谱分析结果', '引擎: mortal']
+        emit = progress or (lambda message: None)
+        current = '等待队列'
         try:
-            async with self.lock:
-                async with self.browser_factory() as browser:
-                    browser.last_submit = self.last_submit
-                    for seat in seats:
-                        game = {'uuid': record.log_id, 'game_id': record.log_id,
-                                'record_url': record.url, 'seat': seat, 'masked': False, 'mode_id': None}
-                        try:
-                            result, html = await browser.analyze(game)
-                        except AnalysisError as exc:
-                            # 不对同一挑战/限流继续发起另外三个请求。
-                            lines.append(f'{("东家", "南家", "西家", "北家")[seat]}未完成：{exc}')
-                            lines.append('后续座位已停止；以上成功结果保留。')
-                            break
-                        finally:
-                            self.last_submit = getattr(browser, 'last_submit', self.last_submit)
-                        lines.append(f"模型: {result.get('model_tag', '未知')}")
-                        lines.append(format_result(result, player_name(html, seat)))
+            async with asyncio.timeout(total_timeout):
+                if self.lock.locked():
+                    emit('正在排队，等待上一份牌谱完成')
+                async with self.lock:
+                    emit('开始启动分析浏览器')
+                    async with self.browser_factory() as browser:
+                        browser.last_submit = self.last_submit
+                        for seat in seats:
+                            current = ('东家', '南家', '西家', '北家')[seat]
+                            browser.progress = lambda message, name=current: emit(f'{name}：{message}')
+                            emit(f'开始分析{current}（{seat + 1}/4）')
+                            game = {'uuid': record.log_id, 'game_id': record.log_id,
+                                    'record_url': record.url, 'seat': seat, 'masked': False, 'mode_id': None}
+                            try:
+                                async with asyncio.timeout(seat_timeout):
+                                    result, html = await browser.analyze(game)
+                            except TimeoutError:
+                                lines.append(f'{current}超过单座位等待上限（{seat_timeout}秒），已停止后续分析。')
+                                break
+                            except AnalysisError as exc:
+                                lines.append(f'{current}未完成：{exc}')
+                                lines.append('后续座位已停止；以上成功结果保留。')
+                                break
+                            finally:
+                                self.last_submit = getattr(browser, 'last_submit', self.last_submit)
+                            entry = f"模型: {result.get('model_tag', '未知')}\n" + format_result(result, player_name(html, seat))
+                            lines.append(entry)
+                            emit(f'{current}分析完成：\n{entry}')
+        except TimeoutError:
+            lines.append(f'本次查询超过总等待上限（{total_timeout}秒），已停止；停在{current}，以上成功结果保留。')
         except AnalysisError as exc:
             lines.append(f'分析未完成：{exc}')
         finally:

@@ -78,9 +78,10 @@ async def _pause(seconds, cancelled):
 
 
 async def solve(parameters, cancelled=lambda: False, transport=None, *, api_key, timeout=180,
-                proxy=None, request_timeout=30):
+                proxy=None, request_timeout=30, progress=None):
     """One paid task at most. Never retry task creation on uncertain responses."""
     key = api_key.strip()
+    emit = progress or (lambda message: None)
     if not key:
         raise AnalysisError("缺少 TWOCAPTCHA_API_KEY。")
     task = {"type": "TurnstileTaskProxyless", "websiteURL": parameters["url"],
@@ -112,10 +113,12 @@ async def solve(parameters, cancelled=lambda: False, transport=None, *, api_key,
             return body
         if cancelled():
             raise AnalysisError("任务已取消。")
+        emit('正在连接 2Captcha 并创建验证任务')
         created = await request("/createTask", {"clientKey": key, "task": task})
         task_id = created.get("taskId")
         if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id <= 0:
             raise AnalysisError("2Captcha 未返回有效任务编号；请检查账户记录，不会自动再次付费创建。")
+        emit('2Captcha 已创建任务，正在等待求解')
         while time.monotonic() < deadline:
             await _pause(min(5, max(0, deadline - time.monotonic())), cancelled)
             if time.monotonic() >= deadline:
@@ -129,6 +132,7 @@ async def solve(parameters, cancelled=lambda: False, transport=None, *, api_key,
             token = solution.get("token") if isinstance(solution, dict) else None
             if not isinstance(token, str) or not token:
                 raise AnalysisError("2Captcha 未返回有效验证结果。")
+            emit('2Captcha 已返回验证结果，交给网站验证')
             return token
     raise AnalysisError("2Captcha 等待超时；任务仍可能计费，请检查账户记录后再重试。")
 
@@ -201,13 +205,15 @@ class TurnstileSolver:
             if not valid:
                 raise AnalysisError('2Captcha HTTP 代理格式错误，请填写 http://主机:端口。')
         self.request_timeout = max(5, min(120, int(request_timeout)))
+        self.progress = lambda message: None
 
     async def solve(self, parameters, cancelled=lambda: False):
         if self.tasks_created >= self.max_tasks:
             raise AnalysisError("本次牌谱已达到 2Captcha 付费任务上限，已停止后续分析。")
         self.tasks_created += 1
         return await solve(parameters, cancelled, api_key=self._api_key, timeout=self.timeout,
-                           proxy=self.proxy, request_timeout=self.request_timeout)
+                           proxy=self.proxy, request_timeout=self.request_timeout,
+                           progress=self.progress)
 
     async def complete(self, page, cancelled=lambda: False):
         return await complete(page, cancelled, solver=self.solve)

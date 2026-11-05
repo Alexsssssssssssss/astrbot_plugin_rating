@@ -1,6 +1,6 @@
 name: astrbot_plugin_rating
 display_name: 雀魂天凤 Rating 查询
 desc: 发送雀魂或天凤牌谱，返回四个座位的 Mortal Rating、一致率与报告链接。
-version: v1.1.1
+version: v1.2.0
 author: Alexsssssssssssss
 repo: https://github.com/Alexsssssssssssss/astrbot_plugin_rating

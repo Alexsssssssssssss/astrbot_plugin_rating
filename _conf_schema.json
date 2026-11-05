@@ -30,6 +30,21 @@
     "type": "int",
     "default": 4
   },
+  "progress_interval": {
+    "description": "等待期间发送进度的间隔（秒，10–120）",
+    "type": "int",
+    "default": 30
+  },
+  "seat_timeout": {
+    "description": "单座位分析总等待上限（秒，包含验证码和报告等待）",
+    "type": "int",
+    "default": 360
+  },
+  "analysis_timeout": {
+    "description": "整份牌谱等待上限（秒，包含排队时间）",
+    "type": "int",
+    "default": 900
+  },
   "auto_detect": {
     "description": "自动识别直接发送的牌谱链接",
     "type": "bool",

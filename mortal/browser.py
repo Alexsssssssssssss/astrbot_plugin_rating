@@ -24,6 +24,7 @@ class MortalBrowser:
         self.pw = self.browser = self.context = None
         self.last_submit = 0
         self.captcha_solver = captcha_solver
+        self.progress = lambda message: None
 
     async def __aenter__(self):
         self.pw = await async_playwright().start()
@@ -71,12 +72,17 @@ class MortalBrowser:
     async def __aexit__(self, *args):
         try:
             if self.browser:
-                await self.browser.close()
-        except BrowserError:
+                async with asyncio.timeout(10):
+                    await self.browser.close()
+        except (BrowserError, TimeoutError):
             pass
         finally:
             if self.pw:
-                await self.pw.stop()
+                try:
+                    async with asyncio.timeout(10):
+                        await self.pw.stop()
+                except (BrowserError, TimeoutError):
+                    pass
 
     async def prepare_form(self, page, game):
         """已在官方网站核对的 reviewForm 控件；不操作派遣个室表单。"""
@@ -257,6 +263,7 @@ class MortalBrowser:
                 meta_snapshots.append(payload)
         self._navigation_observer = observe_meta
         stage = "打开网站"
+        self.progress("打开网站")
         def save_navigation(error=None):
             import json
             diagnostics = []
@@ -300,10 +307,14 @@ class MortalBrowser:
                 raise AnalysisError(f"Mortal 网站返回 HTTP {response.status}。")
             await page.wait_for_timeout(1000)
             stage = "填写分析表单"
+            self.progress("填写分析表单")
             submit = await self.prepare_form(page, game)
             stage = "等待验证完成"
+            self.progress("等待验证完成")
             if await submit.is_disabled() and self.captcha_solver is not None:
                 stage = "2Captcha 验证"
+                self.progress("2Captcha 验证")
+                self.captcha_solver.progress = self.progress
                 await self.captcha_solver.complete(page, cancelled)
             # 等待站点自己的正常验证回调；不生成 token、不点击/破解验证控件。
             verification_deadline = time.monotonic() + int(os.getenv('MORTAL_VERIFICATION_TIMEOUT', '15'))
@@ -315,11 +326,13 @@ class MortalBrowser:
                 raise AnalysisError("Mortal 提交按钮仍在等待 Cloudflare 人机验证，未提交该场牌谱。可在插件设置启用 2Captcha；若已启用，说明本次验证未获网站接受。")
             self.last_submit = time.monotonic()
             stage = "提交分析表单"
+            self.progress("提交分析表单")
             # The click timeout must not cover the server's analysis/queue wait.
             # Response listeners already track the exact submitted request;
             # the following loop owns the longer analysis deadline.
             await submit.click(no_wait_after=True)
             stage = "接收分析报告"
+            self.progress("接收分析报告")
             deadline = time.monotonic() + int(os.getenv("MORTAL_TIMEOUT", "300"))
             last_error = "未收到报告"
             unverified = None
@@ -416,6 +429,7 @@ class MortalBrowser:
             # 任务之间关闭所有页面，防止把上一场报告误当作新结果。
             for p in list(self.context.pages):
                 try:
-                    await p.close()
-                except BrowserError:
+                    async with asyncio.timeout(5):
+                        await p.close()
+                except (BrowserError, TimeoutError):
                     pass

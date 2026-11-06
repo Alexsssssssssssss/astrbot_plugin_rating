@@ -14,7 +14,7 @@ from .mortal.captcha import TurnstileSolver
 from .mortal.reports import AnalysisError
 
 
-@register("astrbot_plugin_rating", "Alexsssssssssssss", "雀魂/天凤 Mortal Rating 查询", "1.2.2")
+@register("astrbot_plugin_rating", "Alexsssssssssssss", "雀魂/天凤 Mortal Rating 查询", "1.2.3")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)

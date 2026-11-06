@@ -2,6 +2,7 @@
 import math
 import json
 import re
+from html.parser import HTMLParser
 
 from bs4 import BeautifulSoup
 from urllib.parse import parse_qs, urlsplit
@@ -13,6 +14,53 @@ class AnalysisError(Exception):
 
 class ReportError(AnalysisError):
     """服务器明确返回的终止错误，不应重试解析直到超时。"""
+
+
+class _MetadataParser(HTMLParser):
+    """dt/dd 的结束标签可省略；不能依赖 html.parser 的兄弟节点树。"""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.fields = {}
+        self.kind = None
+        self.parts = []
+        self.label = None
+
+    def finish_field(self):
+        text = ' '.join(part.strip() for part in self.parts if part.strip())
+        if self.kind == 'dt':
+            self.label = text.casefold()
+        elif self.kind == 'dd' and self.label is not None:
+            self.fields[self.label] = text
+            self.label = None
+        self.kind = None
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('dt', 'dd'):
+            self.finish_field()
+            self.kind = tag
+        elif tag == 'dl':
+            self.finish_field()
+            self.label = None
+
+    def handle_endtag(self, tag):
+        if tag == self.kind:
+            self.finish_field()
+        elif tag == 'dl':
+            self.finish_field()
+            self.label = None
+
+    def handle_data(self, data):
+        if self.kind:
+            self.parts.append(data)
+
+
+def extract_metadata(html):
+    parser = _MetadataParser()
+    parser.feed(html)
+    parser.close()
+    parser.finish_field()
+    return parser.fields
 
 
 def response_summary(content):
@@ -30,7 +78,7 @@ def response_summary(content):
         extra = ''
     else:
         soup = BeautifulSoup(content, 'html.parser')
-        keys = {dt.get_text(' ', strip=True).casefold() for dt in soup.select('dt')}
+        keys = set(extract_metadata(content))
         for label, aliases in (
             ('引擎', {'ai 引擎', 'ai engine', 'engine', 'ai', 'ai 엔진'}),
             ('座位', {'玩家 id', 'player id', 'プレイヤーid', '작사 id'}),
@@ -123,12 +171,7 @@ def parse_json_report(data, expected_seat=None):
 
 
 def parse_html_report(html, expected_seat=None):
-    soup = BeautifulSoup(html, "html.parser")
-    fields = {}
-    for dt in soup.select("dt"):
-        dd = dt.find_next_sibling("dd")
-        if dd:
-            fields[dt.get_text(" ", strip=True).casefold()] = dd.get_text(" ", strip=True)
+    fields = extract_metadata(html)
     engine = next((v for k, v in fields.items() if k in ("ai 引擎", "ai engine", "engine", "aiエンジン", "ai", "ai 엔진")), "")
     if engine.casefold() != "mortal":
         raise AnalysisError("尚未取得 Mortal 报告，或网页格式已变化。")

@@ -129,3 +129,33 @@ async def test_rendered_report_does_not_wait_for_response_body_end(game, html_re
         result, _ = await asyncio.wait_for(browser.analyze(game), timeout=12)
         assert result['rating'] == 90.25 and result['log_id'] == game['uuid']
     assert stopped
+
+
+async def test_server_navigation_to_minified_real_report_format(game):
+    from pathlib import Path
+    html = (Path(__file__).parent / 'fixtures/mortal_minified_metadata.html').read_text()
+    game['seat'] = 0
+    async with MortalBrowser() as browser:
+        async def handle(route):
+            if route.request.method == 'POST':
+                # Playwright route 的 HTTP 重定向会绕过后续 route 拦截。
+                # 浏览器测试使用明确的服务端导航，303 头单独做单元测试。
+                await route.fulfill(content_type='text/html',
+                    headers={'Refresh': '0; url=/report/minified.html'}, body='Loading report')
+            elif '/report/' in route.request.url:
+                await route.fulfill(content_type='text/html; charset=utf-8', body=html)
+            else:
+                await route.fulfill(content_type='text/html', body=OFFICIAL_FORM.replace(' disabled', ''))
+        await browser.context.route('https://mjai.ekyu.moe/**', handle)
+        result, _ = await browser.analyze(game)
+        assert result['rating'] == 92.419
+        assert result['total_matches'] == 138 and result['total_reviewed'] == 162
+        assert result['log_id'] == game['uuid']
+        assert result['identity_method'] == 'official-post-response'
+
+
+def test_303_location_to_minified_report_is_tracked():
+    from types import SimpleNamespace
+    response = SimpleNamespace(url='https://mjai.ekyu.moe/review', status=303,
+                               headers={'location': '/report/minified.html'})
+    assert MortalBrowser.server_redirect_targets(response, '') == {'https://mjai.ekyu.moe/report/minified.html'}

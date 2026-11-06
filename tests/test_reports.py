@@ -65,3 +65,26 @@ def test_response_summary_never_contains_field_values():
     summary = response_summary(html)
     assert secret not in summary and 'Rating' in summary and 'script=1' in summary
     assert secret not in response_summary('{"engine":"' + secret + '"}')
+
+
+def test_actual_report_minified_metadata():
+    from pathlib import Path
+    from mortal.reports import parse_report_payload, response_summary
+    html = (Path(__file__).parent / 'fixtures/mortal_minified_metadata.html').read_text()
+    result = parse_report_payload(html, 0)
+    assert result['rating'] == 92.419
+    assert result['total_matches'] == 138 and result['total_reviewed'] == 162
+    assert result['agreement'] == pytest.approx(138/162*100)
+    assert result['log_id'] is None  # 不凭空补造未在页面内提供的 ID。
+    assert '引擎,座位,Rating,一致率' in response_summary(html)
+    with pytest.raises(AnalysisError, match='座位'):
+        parse_report_payload(html, 1)
+
+
+@pytest.mark.parametrize('end_tags', ['both', 'dt', 'dd'])
+def test_optional_metadata_end_tags(html_report, end_tags):
+    from mortal.reports import parse_html_report
+    if end_tags in ('both', 'dt'): html_report = html_report.replace('</dt>', '')
+    if end_tags in ('both', 'dd'): html_report = html_report.replace('</dd>', '')
+    result = parse_html_report(html_report, 1)
+    assert result['rating'] == 90.25 and result['log_id'] == 'test-game-001'

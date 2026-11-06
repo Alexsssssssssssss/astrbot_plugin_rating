@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from bs4 import BeautifulSoup
 from .browser import MortalBrowser
-from .reports import AnalysisError
+from .reports import AnalysisError, extract_metadata
 
 
 @dataclass(frozen=True)
@@ -71,11 +71,9 @@ def player_name(html: str, seat: int) -> str:
                     return name[:80]
         except (ValueError, AttributeError, IndexError):
             continue
-    for dt in soup.select('dt'):
-        if dt.get_text(' ', strip=True).casefold() in {'玩家名称', '玩家名', 'player name', 'プレイヤー名'}:
-            dd = dt.find_next_sibling('dd')
-            if dd:
-                return dd.get_text(' ', strip=True)[:80].replace('\n', ' ')
+    for key, value in extract_metadata(html).items():
+        if key in {'玩家名称', '玩家名', 'player name', 'プレイヤー名'} and value:
+            return value[:80].replace('\n', ' ')
     return ('东家', '南家', '西家', '北家')[seat]
 
 
